@@ -275,6 +275,12 @@ func (c *connection) closeCallback(needLock, needDetach bool) (err error) {
 			logger.Printf("NETPOLL: closeCallback[%v,%v] detach operator failed: %v", needLock, needDetach, err)
 		}
 	}
+	// The callbacks recycle the operator, netFD and buffers and must therefore
+	// run exactly once even if Close is invoked repeatedly while OnHup or the
+	// processing goroutine is also closing the connection.
+	if !atomic.CompareAndSwapInt32(&c.closeCallbackOnce, 0, 1) {
+		return nil
+	}
 	latest := c.closeCallbacks.Load()
 	if latest == nil {
 		return nil

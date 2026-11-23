@@ -41,17 +41,29 @@ type connection struct {
 	readDeadline  int64 // UnixNano(). it overwrites readTimeout. 0 if not set.
 	readTimer     *time.Timer
 	readTrigger   chan error
+	readMu        sync.Mutex
+	readClosed    bool // guarded by readMu; published together with the readDone broadcast.
+	readDone      chan struct{}
+	readWaiters   int32 // number of read waits currently registered (this close generation).
 	waitReadSize  int64
 	writeTimeout  time.Duration
 	writeDeadline int64 // UnixNano(). it overwrites writeTimeout. 0 if not set.
 	writeTimer    *time.Timer
 	writeTrigger  chan error
+	writeMu       sync.Mutex
+	writeClosed   bool // guarded by writeMu; published together with the writeDone broadcast.
+	writeDone     chan struct{}
+	writeWaiters  int32 // number of queued flush operations currently registered (this close generation).
 	inputBuffer   *LinkBuffer
 	outputBuffer  *LinkBuffer
 	outputBarrier *barrier
 	maxSize       int       // The maximum size of data between two Release().
 	bookSize      int       // The size of data that can be read at once.
 	state         connState // Connection state should be changed sequentially.
+	// closeCallbackOnce guarantees the close callbacks (operator recycle,
+	// netFD close, buffer recycle) run exactly once, no matter how many times
+	// Close/OnHup race to enter closeCallback.
+	closeCallbackOnce int32
 }
 
 var (
@@ -379,6 +391,8 @@ func (c *connection) init(conn Conn, opts *options) (err error) {
 	// init buffer, barrier, finalizer
 	c.readTrigger = make(chan error, 1)
 	c.writeTrigger = make(chan error, 1)
+	c.readDone = make(chan struct{})
+	c.writeDone = make(chan struct{})
 	c.bookSize, c.maxSize = defaultLinkBufferSize, defaultLinkBufferSize
 	c.inputBuffer, c.outputBuffer = NewLinkBuffer(defaultLinkBufferSize), NewLinkBuffer()
 	c.outputBarrier = barrierPool.Get().(*barrier)
@@ -433,6 +447,70 @@ func (c *connection) initFinalizer() {
 	})
 }
 
+// beginReadWait reports whether a new read wait may proceed. Once closing
+// has been published it always fails, so no read can register after the
+// terminal state and therefore no read wait can dangle. A successful
+// registration must be paired with endReadWait.
+func (c *connection) beginReadWait() bool {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	if c.readClosed {
+		return false
+	}
+	atomic.AddInt32(&c.readWaiters, 1)
+	return true
+}
+
+func (c *connection) endReadWait() {
+	atomic.AddInt32(&c.readWaiters, -1)
+}
+
+// beginWriteWait records a queued write operation (a flush about to park on
+// the poller). It returns false once closing starts, so the caller fails the
+// operation rather than waiting for a result that can never arrive. A
+// successful registration must be paired with endWriteWait.
+func (c *connection) beginWriteWait() bool {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.writeClosed {
+		return false
+	}
+	atomic.AddInt32(&c.writeWaiters, 1)
+	return true
+}
+
+func (c *connection) endWriteWait() {
+	atomic.AddInt32(&c.writeWaiters, -1)
+}
+
+// markReadClosed publishes the terminal read state under readMu and
+// broadcasts it exactly once through readDone.
+func (c *connection) markReadClosed() {
+	c.readMu.Lock()
+	if c.readClosed {
+		c.readMu.Unlock()
+		return
+	}
+	c.readClosed = true
+	c.readMu.Unlock()
+	close(c.readDone)
+}
+
+// markWriteClosed publishes the terminal write state and broadcasts it once.
+func (c *connection) markWriteClosed() {
+	c.writeMu.Lock()
+	if c.writeClosed {
+		c.writeMu.Unlock()
+		return
+	}
+	c.writeClosed = true
+	c.writeMu.Unlock()
+	close(c.writeDone)
+}
+
+// triggerRead delivers a real read result. At most one such result can be
+// pending in the single-slot channel; the terminal state is broadcast
+// separately through readDone and therefore cannot be dropped by a full slot.
 func (c *connection) triggerRead(err error) {
 	select {
 	case c.readTrigger <- err:
@@ -445,6 +523,20 @@ func (c *connection) triggerWrite(err error) {
 	case c.writeTrigger <- err:
 	default:
 	}
+}
+
+// closeTriggerRead broadcasts the terminal read state. The concrete error
+// (ErrEOF for peer hup, ErrConnClosed for self close) is mapped by the waiter
+// from the closing party in readClosedErr.
+func (c *connection) closeTriggerRead() {
+	c.markReadClosed()
+}
+
+// closeTriggerWrite broadcasts the terminal write state to every queued
+// flush operation, independently of whether the poller already pushed a
+// real write completion into writeTrigger.
+func (c *connection) closeTriggerWrite() {
+	c.markWriteClosed()
 }
 
 // waitRead will wait full n bytes.
@@ -463,6 +555,11 @@ func (c *connection) waitRead(n int) (err error) {
 	} else if c.readTimeout > 0 {
 		return c.waitReadWithTimeout(n, c.readTimeout)
 	}
+	// reject new reads as soon as closing starts, so no read wait can dangle.
+	if !c.beginReadWait() {
+		return c.readClosedErr()
+	}
+	defer c.endReadWait()
 	// wait full n
 	for c.inputBuffer.Len() < n {
 		switch c.status(closing) {
@@ -471,9 +568,14 @@ func (c *connection) waitRead(n int) (err error) {
 		case user:
 			return Exception(ErrConnClosed, "wait read")
 		default:
-			err = <-c.readTrigger
-			if err != nil {
-				return err
+			select {
+			case err = <-c.readTrigger:
+				if err != nil {
+					return err
+				}
+				// loop back and re-check buffer length and the closing status.
+			case <-c.readDone:
+				return c.readClosedErr()
 			}
 		}
 	}
@@ -482,6 +584,10 @@ func (c *connection) waitRead(n int) (err error) {
 
 // waitReadWithTimeout will wait full n bytes or until timeout.
 func (c *connection) waitReadWithTimeout(n int, timeout time.Duration) (err error) {
+	if !c.beginReadWait() {
+		return c.readClosedErr()
+	}
+	defer c.endReadWait()
 	if c.readTimer == nil {
 		c.readTimer = time.NewTimer(timeout)
 	} else {
@@ -511,6 +617,9 @@ func (c *connection) waitReadWithTimeout(n int, timeout time.Duration) (err erro
 					goto RET
 				}
 				continue
+			case <-c.readDone:
+				err = c.readClosedErr()
+				goto RET
 			}
 		}
 	}
@@ -520,6 +629,14 @@ RET:
 		<-c.readTimer.C
 	}
 	return err
+}
+
+// readClosedErr maps the closing party to the terminal read error.
+func (c *connection) readClosedErr() error {
+	if c.status(closing) == poller {
+		return Exception(ErrEOF, "wait read")
+	}
+	return Exception(ErrConnClosed, "wait read")
 }
 
 // flush writes data directly.
@@ -543,12 +660,37 @@ func (c *connection) flush() error {
 	if c.outputBuffer.IsEmpty() {
 		return nil
 	}
+	// Register before touching the poller so a close that starts from here is
+	// serialized by writeMu and the flush is rejected instead of issuing a
+	// poll control against an operator that is being detached.
+	if !c.beginWriteWait() {
+		return Exception(ErrConnClosed, "when flush")
+	}
+	defer c.endWriteWait()
 	err = c.operator.Control(PollR2RW)
 	if err != nil {
+		// The operator may have been detached (and the fd closed) by a
+		// concurrent close; normalize that to the terminal connection error.
+		if !c.isCloseBy(none) {
+			return Exception(ErrConnClosed, "when flush")
+		}
 		return Exception(err, "when flush")
 	}
 
 	return c.waitFlush()
+}
+
+// classifyWriteResult atomically decides whether a real write result still
+// belongs to an open connection. Holding writeMu makes the decision mutually
+// exclusive with markWriteClosed, closing the window in which a flush could
+// observe a completion and an un-published close in the wrong order.
+func (c *connection) classifyWriteResult(err error) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.writeClosed {
+		return Exception(ErrConnClosed, "wait flush")
+	}
+	return err
 }
 
 func (c *connection) waitFlush() (err error) {
@@ -560,7 +702,17 @@ func (c *connection) waitFlush() (err error) {
 		}
 	}
 	if timeout == 0 {
-		return <-c.writeTrigger
+		// A real completion and the close terminal state can both become ready.
+		// select both and let writeMu classify the final outcome exactly once.
+		select {
+		case err = <-c.writeTrigger:
+			if err != nil {
+				return err
+			}
+			return c.classifyWriteResult(nil)
+		case <-c.writeDone:
+			return Exception(ErrConnClosed, "wait flush")
+		}
 	}
 
 	// set write timeout
@@ -575,11 +727,22 @@ func (c *connection) waitFlush() (err error) {
 		if !c.writeTimer.Stop() { // clean timer
 			<-c.writeTimer.C
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		return c.classifyWriteResult(nil)
+	case <-c.writeDone:
+		if !c.writeTimer.Stop() { // clean timer
+			<-c.writeTimer.C
+		}
+		return Exception(ErrConnClosed, "wait flush")
 	case <-c.writeTimer.C:
 		select {
 		// try fetch writeTrigger if both cases fires
 		case err = <-c.writeTrigger:
+			if err == nil {
+				return c.classifyWriteResult(nil)
+			}
 			return err
 		default:
 		}

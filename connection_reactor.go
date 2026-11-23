@@ -27,8 +27,11 @@ func (c *connection) onHup(p Poll) error {
 	if !c.closeBy(poller) {
 		return nil
 	}
-	c.triggerRead(Exception(ErrEOF, "peer close"))
-	c.triggerWrite(Exception(ErrConnClosed, "peer close"))
+	// The poller has already detached the operator (PollDetach) before OnHup
+	// runs, so no new fd event can arrive from this point on. Broadcast the
+	// terminal state so every registered read/write waiter is woken once.
+	c.closeTriggerRead()
+	c.closeTriggerWrite()
 
 	// call Disconnect callback first
 	c.onDisconnect()
@@ -50,9 +53,14 @@ func (c *connection) onHup(p Poll) error {
 func (c *connection) onClose() error {
 	// user code close the connection
 	if c.closeBy(user) {
-		c.triggerRead(Exception(ErrConnClosed, "self close"))
-		c.triggerWrite(Exception(ErrConnClosed, "self close"))
-		// Detach from poller when processing finished, otherwise it will cause race
+		// closeBy publishes the closing status first; the terminal broadcast
+		// then wakes parked waiters while beginReadWait/beginWriteWait reject
+		// every operation that registers afterwards.
+		c.closeTriggerRead()
+		c.closeTriggerWrite()
+		// closeCallback detaches the operator from the poller first; only after
+		// the fd is removed do the close callbacks free the operator, close the
+		// net fd and recycle the user buffers.
 		c.closeCallback(true, true)
 		return nil
 	}
