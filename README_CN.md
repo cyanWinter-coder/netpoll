@@ -46,6 +46,7 @@ goroutine，大幅增加调度开销。此外，[net.Conn][net.Conn] 没有提�
     - `Dialer` 支持构建 client
     - `EventLoop` 支持构建 server
     - 支持 TCP，Unix Domain Socket
+    - 支持保持报文边界的 UDP 数据报 socket（仅 Linux，通过 `ListenPacket` / `DialUDP`）
     - 支持 Linux，macOS（操作系统）
 
 * **不被支持**

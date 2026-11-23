@@ -38,6 +38,9 @@ const (
 	ErrWriteTimeout = syscall.Errno(0x107)
 	// Concurrent connection access error
 	ErrConcurrentAccess = syscall.Errno(0x108)
+	// A datagram was larger than the receive buffer and had to be truncated.
+	// The remainder is discarded, so the datagram is not delivered across multiple reads.
+	ErrShortDatagram = syscall.Errno(0x109)
 )
 
 const ErrnoMask = 0xFF
@@ -115,4 +118,5 @@ var errnos = [...]string{
 	ErrnoMask & ErrEOF:              "EOF",
 	ErrnoMask & ErrWriteTimeout:     "connection write timeout",
 	ErrnoMask & ErrConcurrentAccess: "concurrent connection access",
+	ErrnoMask & ErrShortDatagram:    "short datagram: message was truncated",
 }

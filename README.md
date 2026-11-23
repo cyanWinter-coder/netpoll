@@ -51,6 +51,7 @@ For more information, please refer to [Document](#document).
     - `Dialer` supports building clients
     - `EventLoop` supports building a server
     - TCP, Unix Domain Socket
+    - UDP datagram sockets with preserved message boundaries (Linux, via `ListenPacket` / `DialUDP`)
     - Linux, macOS (operating system)
 
 * **Unsupported**
