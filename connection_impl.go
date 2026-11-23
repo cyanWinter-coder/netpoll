@@ -17,6 +17,7 @@
 package netpoll
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -31,6 +32,17 @@ const (
 	connStateDisconnected = 2
 )
 
+// timerState holds the generational deadline state of one direction.
+//
+// Every deadline assignment bumps generation and installs a fresh timerNode;
+// a node that becomes due with an outdated generation is ignored by the
+// timerScheduler. Read and write each keep their own state, so updating one
+// direction never affects the other.
+type timerState struct {
+	generation uint64     // incremented on every (re)schedule; 0 means no node scheduled
+	node       *timerNode // node currently registered in the scheduler, nil if cleared
+}
+
 // connection is the implementation of Connection
 type connection struct {
 	netFD
@@ -38,14 +50,16 @@ type connection struct {
 	locker
 	operator      *FDOperator
 	readTimeout   time.Duration
-	readDeadline  int64 // UnixNano(). it overwrites readTimeout. 0 if not set.
-	readTimer     *time.Timer
+	readDeadline  int64 // UnixNano (atomic). it overwrites readTimeout. 0 if not set.
 	readTrigger   chan error
 	waitReadSize  int64
 	writeTimeout  time.Duration
-	writeDeadline int64 // UnixNano(). it overwrites writeTimeout. 0 if not set.
-	writeTimer    *time.Timer
+	writeDeadline int64 // UnixNano (atomic). it overwrites writeTimeout. 0 if not set.
 	writeTrigger  chan error
+	// timerMu protects timers and the generation counters against concurrent
+	// deadline updates / clears / timeout firing / connection close.
+	timerMu       sync.Mutex
+	timers        [2]timerState // index by timerDir: timerRead / timerWrite
 	inputBuffer   *LinkBuffer
 	outputBuffer  *LinkBuffer
 	outputBarrier *barrier
@@ -88,7 +102,9 @@ func (c *connection) SetReadTimeout(timeout time.Duration) error {
 	if timeout >= 0 {
 		c.readTimeout = timeout
 	}
-	c.readDeadline = 0
+	atomic.StoreInt64(&c.readDeadline, 0)
+	// a timeout change cancels any deadline scheduled for an earlier read
+	c.clearReadTimer()
 	return nil
 }
 
@@ -97,39 +113,132 @@ func (c *connection) SetWriteTimeout(timeout time.Duration) error {
 	if timeout >= 0 {
 		c.writeTimeout = timeout
 	}
-	c.writeDeadline = 0
+	atomic.StoreInt64(&c.writeDeadline, 0)
+	// a timeout change cancels any deadline scheduled for an earlier write
+	c.clearWriteTimer()
 	return nil
 }
 
 // SetDeadline implements net.Conn.SetDeadline
 func (c *connection) SetDeadline(t time.Time) error {
-	v := int64(0)
-	if !t.IsZero() {
-		v = t.UnixNano()
+	if err := c.SetReadDeadline(t); err != nil {
+		return err
 	}
-	c.readDeadline = v
-	c.writeDeadline = v
-	return nil
+	return c.SetWriteDeadline(t)
 }
 
 // SetReadDeadline implements net.Conn.SetReadDeadline
 func (c *connection) SetReadDeadline(t time.Time) error {
 	if t.IsZero() {
-		c.readDeadline = 0
-	} else {
-		c.readDeadline = t.UnixNano()
+		atomic.StoreInt64(&c.readDeadline, 0)
+		c.clearReadTimer()
+		return nil
 	}
+	v := t.UnixNano()
+	atomic.StoreInt64(&c.readDeadline, v)
+	c.scheduleReadTimer(v)
 	return nil
 }
 
 // SetWriteDeadline implements net.Conn.SetWriteDeadline
 func (c *connection) SetWriteDeadline(t time.Time) error {
 	if t.IsZero() {
-		c.writeDeadline = 0
-	} else {
-		c.writeDeadline = t.UnixNano()
+		atomic.StoreInt64(&c.writeDeadline, 0)
+		c.clearWriteTimer()
+		return nil
 	}
+	v := t.UnixNano()
+	atomic.StoreInt64(&c.writeDeadline, v)
+	c.scheduleWriteTimer(v)
 	return nil
+}
+
+// scheduleReadTimer installs a new-generation read deadline node. Any node
+// scheduled by an earlier SetReadDeadline call becomes stale and is removed,
+// so an old timeout can never fire against the new deadline.
+func (c *connection) scheduleReadTimer(deadline int64) *timerNode {
+	return c.scheduleTimer(timerRead, deadline)
+}
+
+// scheduleWriteTimer is the write-direction counterpart of scheduleReadTimer.
+func (c *connection) scheduleWriteTimer(deadline int64) *timerNode {
+	return c.scheduleTimer(timerWrite, deadline)
+}
+
+// scheduleTimer bumps the generation of one direction, removes its previous
+// node from the scheduler, and registers a fresh node. Read and write use
+// independent timerState entries, so each direction reschedules on its own.
+// It returns the installed node so a relative (Set*Timeout) waiter can later
+// release only the node it itself scheduled.
+func (c *connection) scheduleTimer(dir timerDir, deadline int64) *timerNode {
+	globalTimerScheduler.start()
+	c.timerMu.Lock()
+	st := &c.timers[dir]
+	old := st.node
+	st.generation++
+	node := globalTimerScheduler.allocNode(c, dir, deadline, st.generation)
+	st.node = node
+	c.timerMu.Unlock()
+	// Recycle the replaced node outside the connection lock. If it already
+	// fired (popped by the loop), remove returns false and the loop owns it.
+	if old != nil && globalTimerScheduler.remove(old) {
+		globalTimerScheduler.nodePool.Put(old)
+	}
+	globalTimerScheduler.schedule(node)
+	return node
+}
+
+// clearReadTimer drops the pending read timer if one exists. The generation
+// bump guarantees that a timer already racing with this clear will observe a
+// stale generation and refuse to fire, so clear vs. timeout has one outcome.
+func (c *connection) clearReadTimer() {
+	c.clearTimer(timerRead)
+}
+
+// clearWriteTimer drops the pending write timer if one exists.
+func (c *connection) clearWriteTimer() {
+	c.clearTimer(timerWrite)
+}
+
+func (c *connection) clearTimer(dir timerDir) {
+	c.timerMu.Lock()
+	st := &c.timers[dir]
+	node := st.node
+	st.node = nil
+	st.generation++ // invalidate any node currently being dispatched
+	c.timerMu.Unlock()
+	if node != nil && globalTimerScheduler.remove(node) {
+		// only recycle when this call actually owned and removed the node;
+		// a node already popped for dispatch is recycled by the scheduler loop.
+		globalTimerScheduler.nodePool.Put(node)
+	}
+}
+
+// clearAllTimers removes every pending timer of the connection. Called on
+// close so a destroyed connection leaves no entries in the scheduler.
+func (c *connection) clearAllTimers() {
+	c.clearReadTimer()
+	c.clearWriteTimer()
+}
+
+// releaseTimer removes node only if it is still the live node of the
+// direction. A relative Set*Timeout waiter uses it on exit so that it cannot
+// tear down a timer installed by a concurrent Set*Deadline call: if the live
+// node differs, a newer deadline owns the slot and this call is a no-op.
+func (c *connection) releaseTimer(dir timerDir, node *timerNode) {
+	if node == nil {
+		return
+	}
+	c.timerMu.Lock()
+	if c.timers[dir].node != node {
+		c.timerMu.Unlock()
+		return
+	}
+	c.timers[dir].node = nil
+	c.timerMu.Unlock()
+	if globalTimerScheduler.remove(node) {
+		globalTimerScheduler.nodePool.Put(node)
+	}
 }
 
 // ------------------------------------------ implement zero-copy reader ------------------------------------------
@@ -423,6 +532,9 @@ func (c *connection) initFDOperator() {
 
 func (c *connection) initFinalizer() {
 	c.AddCloseCallback(func(connection Connection) (err error) {
+		// remove every pending timer first so the destroyed connection leaves
+		// no entries behind and no stale timeout can touch it afterwards.
+		c.clearAllTimers()
 		c.stop(flushing)
 		c.operator.Free()
 		if err = c.netFD.Close(); err != nil {
@@ -454,12 +566,14 @@ func (c *connection) waitRead(n int) (err error) {
 	}
 	atomic.StoreInt64(&c.waitReadSize, int64(n))
 	defer atomic.StoreInt64(&c.waitReadSize, 0)
-	if dl := c.readDeadline; dl > 0 {
+	if dl := atomic.LoadInt64(&c.readDeadline); dl > 0 {
 		timeout := time.Duration(dl - time.Now().UnixNano())
 		if timeout <= 0 {
 			return Exception(ErrReadTimeout, c.remoteAddr.String())
 		}
-		return c.waitReadWithTimeout(n, timeout)
+		// The absolute deadline timer is already installed by
+		// SetReadDeadline (and kept current across updates), just wait on it.
+		return c.waitReadWithTimeout(n, 0)
 	} else if c.readTimeout > 0 {
 		return c.waitReadWithTimeout(n, c.readTimeout)
 	}
@@ -480,46 +594,51 @@ func (c *connection) waitRead(n int) (err error) {
 	return nil
 }
 
-// waitReadWithTimeout will wait full n bytes or until timeout.
+// waitReadWithTimeout waits full n bytes or until timeout.
+//
+// timeout > 0 schedules a fresh relative timer for this wait (SetReadTimeout
+// mode); timeout == 0 means the absolute readDeadline timer installed by
+// SetReadDeadline is already in place and is reused. Either way the wait binds
+// to the timer's generation, so if the deadline is updated or cleared while
+// this goroutine is blocked, only the newest generation can wake it.
 func (c *connection) waitReadWithTimeout(n int, timeout time.Duration) (err error) {
-	if c.readTimer == nil {
-		c.readTimer = time.NewTimer(timeout)
-	} else {
-		c.readTimer.Reset(timeout)
+	var relativeNode *timerNode
+	if timeout > 0 {
+		relativeNode = c.scheduleReadTimer(time.Now().Add(timeout).UnixNano())
+		defer c.releaseTimer(timerRead, relativeNode)
 	}
 
 	for c.inputBuffer.Len() < n {
 		switch c.status(closing) {
 		case poller:
-			// cannot return directly, stop timer first!
-			err = Exception(ErrEOF, "wait read")
-			goto RET
+			return Exception(ErrEOF, "wait read")
 		case user:
-			// cannot return directly, stop timer first!
-			err = Exception(ErrConnClosed, "wait read")
-			goto RET
+			return Exception(ErrConnClosed, "wait read")
 		default:
-			select {
-			case <-c.readTimer.C:
-				// double check if there is enough data to be read
-				if c.inputBuffer.Len() >= n {
-					return nil
+			err = <-c.readTrigger
+			if err != nil {
+				// A timeout error is only honored if it was produced by the
+				// current generation. Stale timeouts from superseded deadlines
+				// are dropped and the wait continues on the new deadline.
+				if errors.Is(err, ErrReadTimeout) && !c.isCurrentTimer(timerRead) {
+					continue
 				}
-				return Exception(ErrReadTimeout, c.remoteAddr.String())
-			case err = <-c.readTrigger:
-				if err != nil {
-					goto RET
-				}
-				continue
+				return err
 			}
+			continue
 		}
 	}
-RET:
-	// clean timer.C
-	if !c.readTimer.Stop() {
-		<-c.readTimer.C
-	}
-	return err
+	return nil
+}
+
+// isCurrentTimer reports whether the readTrigger/writeTrigger error currently
+// waking a waiter was emitted by the timer generation still in effect.
+func (c *connection) isCurrentTimer(dir timerDir) bool {
+	c.timerMu.Lock()
+	st := &c.timers[dir]
+	ok := st.node != nil && st.node.generation == st.generation
+	c.timerMu.Unlock()
+	return ok
 }
 
 // flush writes data directly.
@@ -552,41 +671,37 @@ func (c *connection) flush() error {
 }
 
 func (c *connection) waitFlush() (err error) {
-	timeout := c.writeTimeout
-	if dl := c.writeDeadline; dl > 0 {
-		timeout = time.Duration(dl - time.Now().UnixNano())
-		if timeout <= 0 {
+	var relativeNode *timerNode
+	if dl := atomic.LoadInt64(&c.writeDeadline); dl > 0 {
+		// The absolute deadline timer is maintained by SetWriteDeadline and
+		// survives deadline updates; just check it has not already passed.
+		if dl-time.Now().UnixNano() <= 0 {
 			return Exception(ErrWriteTimeout, c.remoteAddr.String())
 		}
-	}
-	if timeout == 0 {
+	} else if c.writeTimeout > 0 {
+		// relative SetWriteTimeout timer, scoped to this single flush
+		relativeNode = c.scheduleWriteTimer(time.Now().Add(c.writeTimeout).UnixNano())
+		defer c.releaseTimer(timerWrite, relativeNode)
+	} else {
+		// no deadline and no timeout: block until the buffer is flushed
 		return <-c.writeTrigger
 	}
 
-	// set write timeout
-	if c.writeTimer == nil {
-		c.writeTimer = time.NewTimer(timeout)
-	} else {
-		c.writeTimer.Reset(timeout)
-	}
-
-	select {
-	case err = <-c.writeTrigger:
-		if !c.writeTimer.Stop() { // clean timer
-			<-c.writeTimer.C
+	// Loop because a stale timeout (the deadline was updated/cleared before
+	// it fired) lands here as an ErrWriteTimeout but must not fail the flush:
+	// discard it and keep waiting for the real flush completion.
+	for {
+		err = <-c.writeTrigger
+		if errors.Is(err, ErrWriteTimeout) {
+			if c.isCurrentTimer(timerWrite) {
+				return err // live deadline genuinely expired
+			}
+			// superseded generation: the old event already removed write
+			// polling; re-arm it so the still-pending buffer can drain.
+			_ = c.operator.Control(PollR2RW)
+			continue
 		}
 		return err
-	case <-c.writeTimer.C:
-		select {
-		// try fetch writeTrigger if both cases fires
-		case err = <-c.writeTrigger:
-			return err
-		default:
-		}
-		// if timeout, remove write event from poller
-		// we cannot flush it again, since we don't if the poller is still process outputBuffer
-		c.operator.Control(PollRW2R)
-		return Exception(ErrWriteTimeout, c.remoteAddr.String())
 	}
 }
 
