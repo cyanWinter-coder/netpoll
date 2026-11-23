@@ -38,6 +38,8 @@ const (
 	ErrWriteTimeout = syscall.Errno(0x107)
 	// Concurrent connection access error
 	ErrConcurrentAccess = syscall.Errno(0x108)
+	// The poll or server has been closed and no longer accepts new tasks.
+	ErrClosed = syscall.Errno(0x109)
 )
 
 const ErrnoMask = 0xFF
@@ -115,4 +117,5 @@ var errnos = [...]string{
 	ErrnoMask & ErrEOF:              "EOF",
 	ErrnoMask & ErrWriteTimeout:     "connection write timeout",
 	ErrnoMask & ErrConcurrentAccess: "concurrent connection access",
+	ErrnoMask & ErrClosed:           "netpoll has been closed",
 }

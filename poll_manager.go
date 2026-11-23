@@ -69,6 +69,13 @@ func (m *manager) Close() (err error) {
 	for _, poll := range m.polls {
 		err = poll.Close()
 	}
+	// bounded exit: wait until all pollers have exited and released
+	// their wakeup fds, epoll fds and cached operators.
+	for _, poll := range m.polls {
+		if p, ok := poll.(interface{ Done() <-chan struct{} }); ok {
+			<-p.Done()
+		}
+	}
 	m.numLoops = 0
 	m.balance = nil
 	m.polls = nil

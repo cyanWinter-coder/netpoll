@@ -45,6 +45,7 @@ func openDefaultPoll() (*defaultPoll, error) {
 	poll.Reset = poll.reset
 	poll.Handler = poll.handler
 	poll.wop = &FDOperator{FD: int(r0)}
+	poll.done = make(chan struct{})
 
 	if err = poll.Control(poll.wop, PollReadable); err != nil {
 		_ = syscall.Close(poll.wop.FD)
@@ -56,6 +57,13 @@ func openDefaultPoll() (*defaultPoll, error) {
 	return poll, nil
 }
 
+// poll states, transitioned by Close and Wait.
+const (
+	pollStateRunning = iota // accepting new tasks
+	pollStateClosing        // Close called, rejecting new tasks and queued events
+	pollStateClosed         // Wait returned, all resources released
+)
+
 type defaultPoll struct {
 	pollArgs
 	fd      int            // epoll fd
@@ -64,6 +72,14 @@ type defaultPoll struct {
 	trigger uint32         // trigger flag
 	m       sync.Map       //nolint:unused // only used in go:race
 	opcache *operatorCache // operator cache
+	// bounded exit
+	state     int32         // atomic, one of pollState*
+	queued    int32         // atomic, wakeup tasks queued but not yet drained by Wait
+	fdsClosed int32         // atomic, protect closing wop.FD and fd exactly once
+	wmu       sync.Mutex    // serialize writes to wop.FD with closeFDs
+	done      chan struct{} // closed exactly once after Wait returns
+	closeOnce sync.Once     // make Close idempotent
+	closeErr  error         // the result of Close, shared by all Close callers
 	// fns for handle events
 	Reset   func(size, caps int)
 	Handler func(events []epollevent) (closed bool)
@@ -88,6 +104,15 @@ func (a *pollArgs) reset(size, caps int) {
 
 // Wait implements Poll.
 func (p *defaultPoll) Wait() (err error) {
+	// bounded exit: whatever the exit reason is, release the wakeup fd,
+	// the epoll fd and the cached operators, then broadcast the completion
+	// signal shared by all Close callers.
+	defer func() {
+		p.closeFDs()
+		p.opcache.free()
+		atomic.StoreInt32(&p.state, pollStateClosed)
+		close(p.done)
+	}()
 	// init
 	caps, msec, n := barriercap, -1, 0
 	p.Reset(128, caps)
@@ -123,6 +148,14 @@ func (p *defaultPoll) handler(events []epollevent) (closed bool) {
 			continue
 		}
 
+		// bounded exit: once Close is called, queued events must not run new
+		// connection callbacks; only the wakeup event is handled to finish
+		// the exit, other operators are released without any callback.
+		if operator.FD != p.wop.FD && atomic.LoadInt32(&p.state) != pollStateRunning {
+			operator.done()
+			continue
+		}
+
 		var totalRead int
 		evt := events[i].Events
 		triggerRead = evt&syscall.EPOLLIN != 0
@@ -135,10 +168,11 @@ func (p *defaultPoll) handler(events []epollevent) (closed bool) {
 			// must clean trigger first
 			syscall.Read(p.wop.FD, p.buf)
 			atomic.StoreUint32(&p.trigger, 0)
+			// all queued wakeup tasks are drained now
+			atomic.StoreInt32(&p.queued, 0)
 			// if closed & exit
 			if p.buf[0] > 0 {
-				syscall.Close(p.wop.FD)
-				syscall.Close(p.fd)
+				p.closeFDs()
 				operator.done()
 				return true
 			}
@@ -218,24 +252,69 @@ func (p *defaultPoll) handler(events []epollevent) (closed bool) {
 	return false
 }
 
-// Close will write 10000000
+// Close signals the poll to exit and rejects new tasks from now on.
+// It is idempotent: only the first call writes the wakeup fd, and all calls
+// share the same result. The completion of the exit can be waited via Done.
 func (p *defaultPoll) Close() error {
-	_, err := syscall.Write(p.wop.FD, []byte{1, 0, 0, 0, 0, 0, 0, 0})
-	return err
+	p.closeOnce.Do(func() {
+		if !atomic.CompareAndSwapInt32(&p.state, pollStateRunning, pollStateClosing) {
+			// Wait has already exited, nothing to wake up.
+			return
+		}
+		p.wmu.Lock()
+		if atomic.LoadInt32(&p.fdsClosed) == 0 {
+			_, p.closeErr = syscall.Write(p.wop.FD, []byte{1, 0, 0, 0, 0, 0, 0, 0})
+		}
+		p.wmu.Unlock()
+	})
+	return p.closeErr
+}
+
+// Done returns a channel which is closed after Wait returns and all poll
+// resources (wakeup fd, epoll fd and cached operators) have been released.
+// Multiple Close callers can share this same completion signal.
+func (p *defaultPoll) Done() <-chan struct{} {
+	return p.done
+}
+
+// closeFDs releases the wakeup fd and the epoll fd exactly once.
+func (p *defaultPoll) closeFDs() {
+	if !atomic.CompareAndSwapInt32(&p.fdsClosed, 0, 1) {
+		return
+	}
+	p.wmu.Lock()
+	syscall.Close(p.wop.FD)
+	syscall.Close(p.fd)
+	p.wmu.Unlock()
 }
 
 // Trigger implements Poll.
 func (p *defaultPoll) Trigger() error {
+	// bounded exit: reject new tasks once the poll is closing or closed
+	if atomic.LoadInt32(&p.state) != pollStateRunning {
+		return Exception(ErrClosed, "poll trigger")
+	}
 	if atomic.AddUint32(&p.trigger, 1) > 1 {
 		return nil
 	}
+	atomic.AddInt32(&p.queued, 1)
 	// MAX(eventfd) = 0xfffffffffffffffe
+	p.wmu.Lock()
+	if atomic.LoadInt32(&p.fdsClosed) != 0 {
+		p.wmu.Unlock()
+		return Exception(ErrClosed, "poll trigger")
+	}
 	_, err := syscall.Write(p.wop.FD, []byte{0, 0, 0, 0, 0, 0, 0, 1})
+	p.wmu.Unlock()
 	return err
 }
 
 // Control implements Poll.
 func (p *defaultPoll) Control(operator *FDOperator, event PollEvent) error {
+	// bounded exit: reject new tasks once the poll is closing or closed
+	if atomic.LoadInt32(&p.state) != pollStateRunning {
+		return Exception(ErrClosed, "poll control")
+	}
 	// DON'T move `fd=operator.FD` behind inuse() call, we can only access operator before op.inuse() for avoid race
 	// G1:              G2:
 	// op.inuse()       op.unused()

@@ -620,3 +620,68 @@ func newTestEventLoop(network, address string, onRequest OnRequest, opts ...Opti
 	go elp.Serve(ln)
 	return elp
 }
+
+// After server.Close, queued accept events must be rejected with ErrClosed
+// and no new connection callback may be executed.
+func TestServerRejectAcceptAfterClose(t *testing.T) {
+	network, address := "tcp", getTestAddress()
+	ln, err := createTestListener(network, address)
+	MustNil(t, err)
+	svr := newServer(ln, &options{}, func(err error) {})
+	MustNil(t, svr.Run())
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	MustNil(t, svr.Close(ctx))
+
+	// queued accept events after Close must be rejected
+	err = svr.OnRead(nil)
+	Assert(t, errors.Is(err, ErrClosed), err)
+
+	// a conn accepted before Close must be refused instead of running callbacks
+	r, w := GetSysFdPairs()
+	defer syscall.Close(w)
+	conn := newNetFD(r, syscall.AF_UNIX, syscall.SOCK_STREAM, "unix")
+	svr.onAccept(conn)
+	Assert(t, atomic.LoadUint32(&conn.closed) != 0) // conn has been closed by onAccept
+	count := 0
+	svr.connections.Range(func(key, value interface{}) bool {
+		count++
+		return true
+	})
+	Equal(t, count, 0)
+}
+
+// Multiple concurrent Shutdown calls share the same completion and the
+// normal Serve behavior is kept.
+func TestEventLoopConcurrentShutdown(t *testing.T) {
+	network, address := "tcp", getTestAddress()
+	loop := newTestEventLoop(network, address,
+		func(ctx context.Context, conn Connection) error {
+			_, err := conn.Reader().Next(conn.Reader().Len())
+			return err
+		})
+	conn, err := DialConnection(network, address, time.Second)
+	MustNil(t, err)
+	_, err = conn.Write([]byte("ping"))
+	MustNil(t, err)
+
+	const n = 4
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			errs[i] = loop.Shutdown(ctx)
+		}(i)
+	}
+	wg.Wait()
+	for i := 0; i < n; i++ {
+		MustNil(t, errs[i])
+	}
+	// Shutdown after finished is stable
+	MustNil(t, loop.Shutdown(context.Background()))
+}

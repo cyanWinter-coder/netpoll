@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestPollManager(t *testing.T) {
@@ -87,4 +88,23 @@ func TestPollManagerSetNumLoops(t *testing.T) {
 	}
 	wg.Wait()
 	close(finish)
+}
+
+// manager.Close must wait until all pollers exit and release resources,
+// and repeated Close calls must be stable.
+func TestPollManagerCloseBounded(t *testing.T) {
+	pm := newManager(2)
+	poll := pm.Pick()
+	Assert(t, poll != nil)
+
+	done := make(chan error, 1)
+	go func() { done <- pm.Close() }()
+	select {
+	case err := <-done:
+		MustNil(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("manager.Close did not finish in time")
+	}
+	// repeated Close is stable and returns immediately
+	MustNil(t, pm.Close())
 }

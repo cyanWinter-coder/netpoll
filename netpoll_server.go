@@ -21,6 +21,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -39,6 +40,7 @@ type server struct {
 	ln          Listener
 	opts        *options
 	onQuit      func(err error)
+	closed      int32    // atomic: set once Close is called, queued accept events are rejected
 	connections sync.Map // key=fd, value=connection
 }
 
@@ -59,6 +61,9 @@ func (s *server) Run() (err error) {
 
 // Close this server with deadline.
 func (s *server) Close(ctx context.Context) error {
+	// reject queued accept events before detaching, so no new connection
+	// callback can be executed while the server is closing.
+	atomic.StoreInt32(&s.closed, 1)
 	s.operator.Control(PollDetach)
 	s.ln.Close()
 
@@ -96,6 +101,11 @@ func (s *server) Close(ctx context.Context) error {
 
 // OnRead implements FDOperator.
 func (s *server) OnRead(p Poll) error {
+	// bounded exit: the server is closing, queued accept events must not
+	// create new connections.
+	if atomic.LoadInt32(&s.closed) != 0 {
+		return Exception(ErrClosed, "server is closing")
+	}
 	// accept socket
 	conn, err := s.ln.Accept()
 	if err == nil {
@@ -160,6 +170,12 @@ func (s *server) OnHup(p Poll) error {
 }
 
 func (s *server) onAccept(conn Conn) {
+	// bounded exit: the server started closing after the accept, refuse the
+	// connection instead of running new connection callbacks.
+	if atomic.LoadInt32(&s.closed) != 0 {
+		_ = conn.Close()
+		return
+	}
 	// store & register connection
 	nconn := new(connection)
 	nconn.init(conn, s.opts)
