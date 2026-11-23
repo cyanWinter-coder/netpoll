@@ -65,7 +65,10 @@ func readall(op *FDOperator, br barrier) (total int, err error) {
 
 	TryRead:
 		n, err = ioread(op.FD, bs, ivs)
-		op.InputAck(n)
+		if ackErr := op.InputAck(n); ackErr != nil {
+			// terminal read failure (e.g. over-limit input): stop draining
+			return total, ackErr
+		}
 		total += n
 		if err != nil {
 			return total, err

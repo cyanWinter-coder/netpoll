@@ -49,9 +49,11 @@ type connection struct {
 	inputBuffer   *LinkBuffer
 	outputBuffer  *LinkBuffer
 	outputBarrier *barrier
-	maxSize       int       // The maximum size of data between two Release().
-	bookSize      int       // The size of data that can be read at once.
-	state         connState // Connection state should be changed sequentially.
+	maxSize       int          // The maximum size of data between two Release().
+	bookSize      int          // The size of data that can be read at once.
+	maxInputLen   int32        // The maximum size of unconsumed input data. 0 means unlimited.
+	termReadErr   atomic.Value // terminal read error (e.g. ErrConnInputExceeded), stable across wake-up ordering
+	state         connState    // Connection state should be changed sequentially.
 }
 
 var (
@@ -434,6 +436,24 @@ func (c *connection) initFinalizer() {
 }
 
 func (c *connection) triggerRead(err error) {
+	if err != nil {
+		// an error must reach the blocked reader even if a stale trigger is
+		// still sitting in the buffered channel: replace it without blocking
+		// the poller goroutine.
+		select {
+		case c.readTrigger <- err:
+		default:
+			select {
+			case <-c.readTrigger:
+			default:
+			}
+			select {
+			case c.readTrigger <- err:
+			default:
+			}
+		}
+		return
+	}
 	select {
 	case c.readTrigger <- err:
 	default:
@@ -447,10 +467,24 @@ func (c *connection) triggerWrite(err error) {
 	}
 }
 
+// terminalReadErr returns the stable terminal read error recorded for this
+// connection, if any. It takes precedence over generic close/EOF errors so the
+// reader observes the real cause (e.g. ErrConnInputExceeded) regardless of the
+// order in which the closing flag and the read trigger become visible.
+func (c *connection) terminalReadErr() (err error) {
+	if v := c.termReadErr.Load(); v != nil {
+		return v.(error)
+	}
+	return nil
+}
+
 // waitRead will wait full n bytes.
 func (c *connection) waitRead(n int) (err error) {
 	if n <= c.inputBuffer.Len() {
 		return nil
+	}
+	if err = c.terminalReadErr(); err != nil {
+		return err
 	}
 	atomic.StoreInt64(&c.waitReadSize, int64(n))
 	defer atomic.StoreInt64(&c.waitReadSize, 0)
@@ -465,6 +499,9 @@ func (c *connection) waitRead(n int) (err error) {
 	}
 	// wait full n
 	for c.inputBuffer.Len() < n {
+		if termErr := c.terminalReadErr(); termErr != nil {
+			return termErr
+		}
 		switch c.status(closing) {
 		case poller:
 			return Exception(ErrEOF, "wait read")
@@ -489,6 +526,10 @@ func (c *connection) waitReadWithTimeout(n int, timeout time.Duration) (err erro
 	}
 
 	for c.inputBuffer.Len() < n {
+		if termErr := c.terminalReadErr(); termErr != nil {
+			err = termErr
+			goto RET
+		}
 		switch c.status(closing) {
 		case poller:
 			// cannot return directly, stop timer first!

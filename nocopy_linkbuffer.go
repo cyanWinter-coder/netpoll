@@ -646,6 +646,17 @@ func (b *UnsafeLinkBuffer) Close() (err error) {
 	return nil
 }
 
+// forceReset discards every node of the current buffer generation and installs
+// a fresh empty chain. It is only used when the owning connection fails with a
+// terminal error (e.g. ErrConnInputExceeded): all slices previously exposed to
+// user code become invalid and the underlying memory is returned to the pool
+// immediately instead of waiting for a Release that will never come.
+func (b *UnsafeLinkBuffer) forceReset() {
+	b.Close()
+	node := newLinkBufferNode(0)
+	b.head, b.read, b.flush, b.write = node, node, node, node
+}
+
 // ------------------------------------------ implement connection interface ------------------------------------------
 
 // Bytes returns all the readable bytes of this LinkBuffer.

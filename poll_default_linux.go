@@ -155,7 +155,12 @@ func (p *defaultPoll) handler(events []epollevent) (closed bool) {
 				bs := operator.Inputs(p.barriers[i].bs)
 				if len(bs) > 0 {
 					n, err := ioread(operator.FD, bs, p.barriers[i].ivs)
-					operator.InputAck(n)
+					if ackErr := operator.InputAck(n); ackErr != nil {
+						// terminal read failure (e.g. over-limit input): detach
+						// and schedule the hang-up path for this operator
+						p.appendHup(operator)
+						continue
+					}
 					totalRead += n
 					if err != nil {
 						p.appendHup(operator)

@@ -99,6 +99,7 @@ func (c *connection) onPrepare(opts *options) (err error) {
 		c.SetReadTimeout(opts.readTimeout)
 		c.SetWriteTimeout(opts.writeTimeout)
 		c.SetIdleTimeout(opts.idleTimeout)
+		atomic.StoreInt32(&c.maxInputLen, int32(opts.maxInputLength))
 
 		// calling prepare first and then register.
 		if opts.onPrepare != nil {

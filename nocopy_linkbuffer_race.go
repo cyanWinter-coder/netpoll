@@ -180,6 +180,13 @@ func (b *SafeLinkBuffer) Close() (err error) {
 	return b.UnsafeLinkBuffer.Close()
 }
 
+// forceReset discards the current buffer generation and installs a fresh chain.
+func (b *SafeLinkBuffer) forceReset() {
+	b.Lock()
+	defer b.Unlock()
+	b.UnsafeLinkBuffer.forceReset()
+}
+
 // ------------------------------------------ implement connection interface ------------------------------------------
 
 // Bytes returns all the readable bytes of this SafeLinkBuffer.

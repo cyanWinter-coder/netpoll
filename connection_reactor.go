@@ -17,6 +17,7 @@
 package netpoll
 
 import (
+	"fmt"
 	"sync/atomic"
 )
 
@@ -107,6 +108,14 @@ func (c *connection) inputAck(n int) (err error) {
 		c.maxSize = mallocMax
 	}
 
+	// Requirement: oversized unconsumed input must fail with a stable error and
+	// recycle the current generation of read buffers. The check runs after the
+	// bytes are published, so length reflects exactly the data held for the user.
+	maxInputLen := int(atomic.LoadInt32(&c.maxInputLen))
+	if maxInputLen > 0 && length > maxInputLen {
+		return c.onInputExceeded(length, maxInputLen)
+	}
+
 	needTrigger := true
 	if length == n { // first start onRequest
 		needTrigger = c.onRequest()
@@ -115,6 +124,22 @@ func (c *connection) inputAck(n int) (err error) {
 		c.triggerRead(nil)
 	}
 	return nil
+}
+
+// onInputExceeded handles the over-limit case. It publishes the stable error,
+// recycles the current buffer generation and wakes any blocked reader. The
+// poller handler is responsible for detaching the operator and invoking onHup
+// via appendHup, so this function must not touch operator state itself.
+func (c *connection) onInputExceeded(length, maxInputLen int) error {
+	err := Exception(ErrConnInputExceeded, fmt.Sprintf("input length[%d] exceeds limit[%d]", length, maxInputLen))
+	// publish the stable cause before anything else, so a reader woken via the
+	// closing flag (rather than the trigger channel) still observes this error.
+	c.termReadErr.Store(err)
+	// recycle the current generation of read buffers; exposed slices are invalid now
+	c.inputBuffer.forceReset()
+	// unblock waitRead/waitReadWithTimeout deterministically
+	c.triggerRead(err)
+	return err
 }
 
 // outputs implements FDOperator.

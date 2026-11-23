@@ -104,7 +104,11 @@ func (p *defaultPoll) Wait() error {
 					bs := operator.Inputs(barriers[i].bs)
 					if len(bs) > 0 {
 						n, err := ioread(operator.FD, bs, barriers[i].ivs)
-						operator.InputAck(n)
+						if ackErr := operator.InputAck(n); ackErr != nil {
+							// terminal read failure (e.g. over-limit input)
+							p.appendHup(operator)
+							continue
+						}
 						totalRead += n
 						if err != nil {
 							p.appendHup(operator)

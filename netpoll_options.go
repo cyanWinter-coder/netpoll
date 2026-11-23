@@ -22,13 +22,14 @@ type Option struct {
 }
 
 type options struct {
-	onPrepare    OnPrepare
-	onConnect    OnConnect
-	onDisconnect OnDisconnect
-	onRequest    OnRequest
-	readTimeout  time.Duration
-	writeTimeout time.Duration
-	idleTimeout  time.Duration
+	onPrepare      OnPrepare
+	onConnect      OnConnect
+	onDisconnect   OnDisconnect
+	onRequest      OnRequest
+	readTimeout    time.Duration
+	writeTimeout   time.Duration
+	idleTimeout    time.Duration
+	maxInputLength int
 }
 
 // WithOnPrepare registers the OnPrepare method to EventLoop.
@@ -70,5 +71,18 @@ func WithWriteTimeout(timeout time.Duration) Option {
 func WithIdleTimeout(timeout time.Duration) Option {
 	return Option{func(op *options) {
 		op.idleTimeout = timeout
+	}}
+}
+
+// WithMaxInputLength sets the upper bound on the amount of unconsumed input
+// data (in bytes) that may accumulate in a connection's read buffer.
+//
+// When a read would push the buffered, unconsumed data past the limit, the
+// connection fails the read with a stable ErrConnInputExceeded error, recycles
+// the current generation of read buffers and closes itself. A non-positive
+// value disables the limit, which is the default.
+func WithMaxInputLength(n int) Option {
+	return Option{func(op *options) {
+		op.maxInputLength = n
 	}}
 }

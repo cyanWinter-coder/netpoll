@@ -38,6 +38,10 @@ const (
 	ErrWriteTimeout = syscall.Errno(0x107)
 	// Concurrent connection access error
 	ErrConcurrentAccess = syscall.Errno(0x108)
+	// ErrConnInputExceeded is returned when the unconsumed input data of a
+	// connection exceeds the configured MaxInputLength. The connection is then
+	// closed and the current generation of read buffers is recycled.
+	ErrConnInputExceeded = syscall.Errno(0x109)
 )
 
 const ErrnoMask = 0xFF
@@ -107,12 +111,13 @@ func (e *exception) Temporary() bool {
 
 // Errors defined in netpoll
 var errnos = [...]string{
-	ErrnoMask & ErrConnClosed:       "connection has been closed",
-	ErrnoMask & ErrReadTimeout:      "connection read timeout",
-	ErrnoMask & ErrDialTimeout:      "dial wait timeout",
-	ErrnoMask & ErrDialNoDeadline:   "dial no deadline",
-	ErrnoMask & ErrUnsupported:      "netpoll does not support",
-	ErrnoMask & ErrEOF:              "EOF",
-	ErrnoMask & ErrWriteTimeout:     "connection write timeout",
-	ErrnoMask & ErrConcurrentAccess: "concurrent connection access",
+	ErrnoMask & ErrConnClosed:        "connection has been closed",
+	ErrnoMask & ErrReadTimeout:       "connection read timeout",
+	ErrnoMask & ErrDialTimeout:       "dial wait timeout",
+	ErrnoMask & ErrDialNoDeadline:    "dial no deadline",
+	ErrnoMask & ErrUnsupported:       "netpoll does not support",
+	ErrnoMask & ErrEOF:               "EOF",
+	ErrnoMask & ErrWriteTimeout:      "connection write timeout",
+	ErrnoMask & ErrConcurrentAccess:  "concurrent connection access",
+	ErrnoMask & ErrConnInputExceeded: "connection input length exceeded the limit",
 }
